@@ -73,7 +73,7 @@ public class ResponseAnalysisTool implements McpTool {
         
         // For reflection analysis  
         properties.put("proxyIds", McpUtils.createProperty("array",
-            "Optional 1-based proxy history IDs to analyze for reflection points. Omit to inspect recent proxy history."));
+            "Optional proxy history IDs (Burp's # numbers, as returned by burp_proxy_history) to analyze for reflection points. Omit to inspect recent proxy history."));
         
         properties.put("testString", McpUtils.createProperty("string",
             "Optional label echoed in reflection output for caller correlation. Reflection detection inspects request values from proxy history.", "REFLECTED_TEST_12345"));
@@ -543,14 +543,14 @@ public class ResponseAnalysisTool implements McpTool {
             if (arguments.has("proxyIds") && arguments.get("proxyIds").isArray()) {
                 for (JsonNode node : arguments.get("proxyIds")) {
                     Integer id = parseProxyId(node);
-                    if (id == null || id < 1 || id > history.size()) {
-                        if (id != null) {
-                            invalidProxyIds.add(id);
-                        }
+                    if (id == null) continue;
+                    ProxyHttpRequestResponse item = ProxyHistoryTool.findById(history, id);
+                    if (item == null) {
+                        invalidProxyIds.add(id);
                         continue;
                     }
                     requestedProxyIds.add(id);
-                    candidates.add(history.get(id - 1));
+                    candidates.add(item);
                 }
             } else {
                 for (int i = history.size() - 1; i >= 0; i--) {

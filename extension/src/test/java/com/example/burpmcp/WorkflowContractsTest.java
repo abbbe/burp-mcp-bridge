@@ -446,10 +446,12 @@ public class WorkflowContractsTest {
     private void addHistory(String url, String body) {
         HttpRequest request = request(url, "GET /a HTTP/1.1\r\nHost: example.test\r\n\r\n", service("example.test", 443, true));
         HttpResponse response = response("HTTP/1.1 200 OK\r\n\r\n" + body);
+        int id = history.size() + 1;
         history.add(proxy(ProxyHttpRequestResponse.class, (method, args) -> switch (method) {
             case "finalRequest", "request" -> request;
             case "response", "originalResponse" -> response;
             case "hasResponse" -> true;
+            case "id" -> id;
             default -> null;
         }));
     }

@@ -65,6 +65,7 @@ public class UtilityOutputSchemasTest {
             case "finalRequest", "request" -> sampleRequest;
             case "response" -> sampleResponse;
             case "annotations" -> annotations();
+            case "id" -> 1;
             default -> defaultValue(m.getReturnType());
         });
         organizerItems = List.of(organizerItem(7, true), organizerItem(8, false));

@@ -56,6 +56,15 @@ public class ProxyHistoryTool implements McpTool {
         this.api = api;
     }
 
+    // Look up an entry by Burp's own proxy history number (the "#" column).
+    // Unlike the position in api.proxy().history(), it survives deleted entries.
+    public static ProxyHttpRequestResponse findById(List<ProxyHttpRequestResponse> history, int id) {
+        for (ProxyHttpRequestResponse entry : history) {
+            if (entry.id() == id) return entry;
+        }
+        return null;
+    }
+
     @Override
     public Map<String, Object> getToolInfo() {
         Map<String, Object> tool = new HashMap<>();
@@ -364,7 +373,7 @@ public class ProxyHistoryTool implements McpTool {
         outputProps.put("total", SchemaHelper.intProp("Total matching entries"));
         outputProps.put("showing", SchemaHelper.intProp("Number of entries returned"));
         Map<String, Object> entryItemProps = new HashMap<>();
-        entryItemProps.put("id", SchemaHelper.intProp("Original proxy history index"));
+        entryItemProps.put("id", SchemaHelper.intProp("Burp proxy history number (the # column)"));
         entryItemProps.put("method", SchemaHelper.stringProp("HTTP method"));
         entryItemProps.put("status", Map.of("type", List.of("integer", "null"), "description", "HTTP status code, or null if no response was captured."));
         entryItemProps.put("url", SchemaHelper.stringProp("Request URL"));
@@ -470,14 +479,13 @@ public class ProxyHistoryTool implements McpTool {
         for (Integer id : entryIds) {
             Map<String, Object> e = new HashMap<>();
             e.put("id", id);
-            if (id < 1 || id > proxyHistory.size()) {
+            ProxyHttpRequestResponse entry = findById(proxyHistory, id);
+            if (entry == null) {
                 e.put("error", "not_found");
-                e.put("validRange", "1-" + proxyHistory.size());
                 jsonEntries.add(e);
                 continue;
             }
 
-            ProxyHttpRequestResponse entry = proxyHistory.get(id - 1);
             HttpRequest req = entry.finalRequest();
             e.put("url", req.url());
             e.put("method", req.method());
@@ -553,7 +561,7 @@ public class ProxyHistoryTool implements McpTool {
         for (Map<String, Object> e : jsonEntries) {
             int id = (Integer) e.get("id");
             if (e.containsKey("error")) {
-                result.append(String.format("❌ Entry #%d not found (valid: %s)\n\n", id, e.get("validRange")));
+                result.append(String.format("❌ Entry #%d not found\n\n", id));
                 continue;
             }
 
@@ -850,7 +858,7 @@ public class ProxyHistoryTool implements McpTool {
             ProxyHttpRequestResponse entry = proxyHistory.get(i);
             try {
                 // Apply all filters
-                int entryId = i + 1;
+                int entryId = entry.id();
                 if (afterEntry != null && entryId <= afterEntry) continue;
                 if (beforeEntry != null && entryId >= beforeEntry) continue;
                 HttpRequest req = entry.finalRequest();
@@ -976,7 +984,7 @@ public class ProxyHistoryTool implements McpTool {
                 }
                 
                 filtered.add(entry);
-                originalIndices.add(i + 1);  // Add 1 because proxy history IDs start from 1
+                originalIndices.add(entry.id());  // Burp's history number, not the list position
             } catch (Exception e) {
                 // Skip problematic entries
             }

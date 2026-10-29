@@ -153,7 +153,7 @@ public class AnnotateTool implements McpTool {
         // request is deterministic even when URL+method aren't unique.
         Map<String, Object> entryIdProperty = new HashMap<>();
         entryIdProperty.put("type", "integer");
-        entryIdProperty.put("description", "Exact entry id (1-based). For ANNOTATE_PROXY / CLEAR_ANNOTATIONS source=PROXY: same id space as burp_proxy_history returns (proxy-history index + 1). For ANNOTATE_TARGET: index into api.siteMap().requestResponses() + 1 — Burp's Montoya sitemap exposes no stable id, so this is the current in-memory ordering and is NOT interchangeable with the proxy id. For CLEAR_ANNOTATIONS the source param must be PROXY when entryId is given (or omitted, which defaults to PROXY); TARGET+entryId or ALL+entryId are rejected. url/method/pattern filters are ignored when entryId is set.");
+        entryIdProperty.put("description", "Exact entry id (1-based). For ANNOTATE_PROXY / CLEAR_ANNOTATIONS source=PROXY: same id space as burp_proxy_history returns (Burp's proxy history # number). For ANNOTATE_TARGET: index into api.siteMap().requestResponses() + 1 — Burp's Montoya sitemap exposes no stable id, so this is the current in-memory ordering and is NOT interchangeable with the proxy id. For CLEAR_ANNOTATIONS the source param must be PROXY when entryId is given (or omitted, which defaults to PROXY); TARGET+entryId or ALL+entryId are rejected. url/method/pattern filters are ignored when entryId is set.");
         properties.put("entryId", entryIdProperty);
 
         // Notes mode — APPEND (default, preserves audit trail) vs REPLACE.
@@ -319,11 +319,10 @@ public class AnnotateTool implements McpTool {
         ProxyHttpRequestResponse targetEntry = null;
 
         if (entryId != null) {
-            int idx = entryId - 1;
-            if (idx < 0 || idx >= proxyHistory.size()) {
-                return McpUtils.createErrorResponse("entryId " + entryId + " out of range (proxy history size: " + proxyHistory.size() + ")");
+            targetEntry = ProxyHistoryTool.findById(proxyHistory, entryId);
+            if (targetEntry == null) {
+                return McpUtils.createErrorResponse("entryId " + entryId + " not found in proxy history");
             }
-            targetEntry = proxyHistory.get(idx);
         } else {
             if (url == null || url.isEmpty()) {
                 return McpUtils.createErrorResponse("Either entryId or url is required for ANNOTATE_PROXY action");
@@ -1785,11 +1784,10 @@ public class AnnotateTool implements McpTool {
                     "To clear a Target/Site Map annotation, use url + method filters instead.");
             }
             List<ProxyHttpRequestResponse> proxyHistory = api.proxy().history();
-            int idx = entryId - 1;
-            if (idx < 0 || idx >= proxyHistory.size()) {
-                return McpUtils.createErrorResponse("entryId " + entryId + " out of range (proxy history size: " + proxyHistory.size() + ")");
+            ProxyHttpRequestResponse e = ProxyHistoryTool.findById(proxyHistory, entryId);
+            if (e == null) {
+                return McpUtils.createErrorResponse("entryId " + entryId + " not found in proxy history");
             }
-            ProxyHttpRequestResponse e = proxyHistory.get(idx);
             boolean had = hasAnnotations(e.annotations());
             clearAnnotation(e.annotations());
             Map<String, Object> data = new HashMap<>();
