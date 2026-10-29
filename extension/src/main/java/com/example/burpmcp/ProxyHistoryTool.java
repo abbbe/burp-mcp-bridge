@@ -112,7 +112,7 @@ public class ProxyHistoryTool implements McpTool {
         // Iteration parameters
         Map<String, Object> startAtProperty = new HashMap<>();
         startAtProperty.put("type", "integer");
-        startAtProperty.put("description", "Starting entry for iterate mode (default: 1)");
+        startAtProperty.put("description", "Iterate mode: Burp proxy history number (#, the id from list) to start at; walks forward in # order from the first entry at or after it (default: 1)");
         startAtProperty.put("default", 1);
         properties.put("startAt", startAtProperty);
         
@@ -229,7 +229,7 @@ public class ProxyHistoryTool implements McpTool {
         
         Map<String, Object> recentProperty = new HashMap<>();
         recentProperty.put("type", "boolean");
-        recentProperty.put("description", "Sort most recent first");
+        recentProperty.put("description", "List mode: sort most recent first");
         recentProperty.put("default", true);
         properties.put("recent", recentProperty);
 
@@ -625,26 +625,35 @@ public class ProxyHistoryTool implements McpTool {
     }
     
     private Object executeIterateMode(JsonNode arguments) throws Exception {
+        // startAt is Burp's proxy history number (the # column), the same id
+        // list, detail and burp_annotate use, and iteration walks forward in #
+        // order. It used to be a 1-based position in the filtered list,
+        // reversed newest-first by default (recent=true), so its numbers matched
+        // neither Burp's # nor the ids from list. `recent` no longer applies
+        // here: to browse recent traffic, take an id from list and start there.
         int startAt = arguments.has("startAt") ? arguments.get("startAt").asInt() : 1;
-        int count = arguments.has("count") ? arguments.get("count").asInt() : 1;
+        int count = Math.max(1, arguments.has("count") ? arguments.get("count").asInt() : 1);
         boolean verbose = McpUtils.isVerbose(arguments);
 
+        // applyFilters keeps api.proxy().history() order, i.e. ascending #.
         FilteredResults results = applyFilters(arguments);
         List<ProxyHttpRequestResponse> filtered = results.entries;
-        boolean recent = arguments.has("recent") ? arguments.get("recent").asBoolean() : true;
 
-        if (recent) {
-            java.util.Collections.reverse(filtered);
-        }
-
-        int endAt = Math.min(startAt + count - 1, filtered.size());
+        // First entry at or after startAt, so a deleted or filtered-out number
+        // continues at the next entry instead of returning nothing.
+        int from = 0;
+        while (from < filtered.size() && filtered.get(from).id() < startAt) from++;
+        int to = Math.min(from + count, filtered.size());
+        Integer endAt = to > from ? filtered.get(to - 1).id() : null;
+        Integer nextStartAt = to < filtered.size() ? filtered.get(to).id() : null;
+        Integer previousStartAt = from > 0 ? filtered.get(Math.max(0, from - count)).id() : null;
 
         // Build structured entries
         List<Map<String, Object>> jsonEntries = new ArrayList<>();
-        for (int i = startAt - 1; i < endAt && i < filtered.size(); i++) {
+        for (int i = from; i < to; i++) {
             ProxyHttpRequestResponse entry = filtered.get(i);
             Map<String, Object> e = new HashMap<>();
-            e.put("entryNumber", i + 1);
+            e.put("id", entry.id());
             e.put("url", entry.finalRequest().url());
             e.put("method", entry.finalRequest().method());
             if (entry.hasResponse()) {
@@ -686,12 +695,12 @@ public class ProxyHistoryTool implements McpTool {
             Map<String, Object> data = new HashMap<>();
             data.put("totalFiltered", filtered.size());
             data.put("startAt", startAt);
-            data.put("endAt", endAt);
+            if (endAt != null) data.put("endAt", endAt);
             data.put("count", count);
             data.put("entries", jsonEntries);
             Map<String, Object> nav = new HashMap<>();
-            if (endAt < filtered.size()) nav.put("nextStartAt", endAt + 1);
-            if (startAt > 1) nav.put("previousStartAt", Math.max(1, startAt - count));
+            if (nextStartAt != null) nav.put("nextStartAt", nextStartAt);
+            if (previousStartAt != null) nav.put("previousStartAt", previousStartAt);
             data.put("navigation", nav);
             return McpUtils.createJsonResponse(data);
         }
@@ -699,10 +708,15 @@ public class ProxyHistoryTool implements McpTool {
         // Verbose markdown output
         StringBuilder result = new StringBuilder();
         result.append("🔄 **ITERATING PROXY HISTORY**\n\n");
-        result.append(String.format("**Showing:** Entries %d-%d of %d total\n\n", startAt, endAt, filtered.size()));
+        if (jsonEntries.isEmpty()) {
+            result.append(String.format("**Showing:** no entries at or after #%d (%d matching in total)\n\n", startAt, filtered.size()));
+        } else {
+            result.append(String.format("**Showing:** %d entries, #%d to #%d, of %d matching\n\n",
+                                      jsonEntries.size(), jsonEntries.get(0).get("id"), endAt, filtered.size()));
+        }
 
         for (Map<String, Object> e : jsonEntries) {
-            result.append(String.format("## 📌 Entry #%d of %d\n\n", e.get("entryNumber"), filtered.size()));
+            result.append(String.format("## 📌 Entry #%d\n\n", e.get("id")));
             result.append("**URL:** `").append(e.get("url")).append("`\n");
             result.append("**Method:** ").append(e.get("method")).append("\n");
             result.append("**Status:** ").append(e.containsKey("statusCode") ? e.get("statusCode") : "No Response").append("\n\n");
@@ -729,14 +743,13 @@ public class ProxyHistoryTool implements McpTool {
         }
 
         result.append("### 🧭 Navigation\n");
-        if (endAt < filtered.size()) {
-            result.append(String.format("• **Next:** `action: \"iterate\", startAt: %d, count: %d`\n", endAt + 1, count));
+        if (nextStartAt != null) {
+            result.append(String.format("• **Next:** `action: \"iterate\", startAt: %d, count: %d`\n", nextStartAt, count));
         }
-        if (startAt > 1) {
-            result.append(String.format("• **Previous:** `action: \"iterate\", startAt: %d, count: %d`\n",
-                                      Math.max(1, startAt - count), count));
+        if (previousStartAt != null) {
+            result.append(String.format("• **Previous:** `action: \"iterate\", startAt: %d, count: %d`\n", previousStartAt, count));
         }
-        result.append(String.format("• **Jump to:** `action: \"iterate\", startAt: [entry_number], count: %d`\n", count));
+        result.append(String.format("• **Jump to:** `action: \"iterate\", startAt: [entry #], count: %d`\n", count));
 
         Map<String, Object> response = new HashMap<>();
         response.put("type", "text");

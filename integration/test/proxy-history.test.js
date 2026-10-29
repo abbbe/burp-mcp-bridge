@@ -55,18 +55,17 @@ test('detail by id returns that entry with full request and response', async () 
   assert.match(d.response.body, new RegExp(`reflected:\\[${m}a\\]`));
 });
 
-// BUG: iterate treats startAt as a 1-based position in the filtered list,
-// reversed newest-first by default (recent=true), and reports that position as
-// `entryNumber`. So its numbers are neither Burp's # nor the `id` that
-// list/detail/annotate use — the same class of bug d5af19d fixed for
-// list/detail. This test fails until iterate is fixed. Compared by URL so it
-// does not prescribe the field name a fix should use.
+// iterate's startAt is Burp's #, the same id list/detail/annotate use, and it
+// walks forward in # order (fixed in 2.10.0; it used to take a newest-first
+// list position and report that as `entryNumber`). Compared by URL, plus the
+// reported ids, so both the walk and the numbering are checked.
 test('iterate from startAt=<Burp #> walks the same entries list reports', async () => {
   const mine = await historyMatching(client, m);
   const s = await callOk(client, 'burp_proxy_history', {
     action: 'iterate', startAt: mine[0].id, count: 3
   });
   assert.deepEqual(s.entries.map((e) => e.url), mine.map((e) => e.url));
+  assert.deepEqual(s.entries.map((e) => e.id), mine.map((e) => e.id));
 });
 
 test('afterEntry / beforeEntry bound the list by entry id', async () => {
