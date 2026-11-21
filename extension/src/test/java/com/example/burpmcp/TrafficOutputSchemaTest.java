@@ -207,6 +207,9 @@ public class TrafficOutputSchemaTest {
         call(name, "proxy_history", "filter", "short", "limit", 1);
         call(name, "close", "connectionId", id);
         assertEquals(0, call(name, "list_connections").path("activeCount").asInt());
+        Field counts = WebSocketTool.class.getDeclaredField("messageCounts");
+        counts.setAccessible(true);
+        assertFalse("close must release per-connection message state", ((Map<?, ?>) counts.get(null)).containsKey(id));
 
         ObjectNode invalid = messages.deepCopy();
         ((ObjectNode) invalid.path("messages").get(0)).put("direction", "inbound");

@@ -22,14 +22,17 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class WebSocketTool implements McpTool {
     private final MontoyaApi api;
     private static final AtomicInteger connectionCounter = new AtomicInteger(0);
     private static final Map<String, ExtensionWebSocket> activeConnections = new ConcurrentHashMap<>();
-    private static final Map<String, List<Map<String, Object>>> messageHistory = new ConcurrentHashMap<>();
+    // Per-connection count of sent + received messages, reported by list_connections.
+    // Only the count is ever consumed, so payloads are not retained: storing them grew
+    // without bound for long-lived sockets. Entries are removed when the connection is
+    // closed (by the client via the close action, or by the server via onClose).
+    private static final Map<String, AtomicLong> messageCounts = new ConcurrentHashMap<>();
 
     // Dedicated daemon executor for the potentially-blocking Montoya WebSocket send.
     // sendTextMessage()/sendBinaryMessage() can block indefinitely on a stalled
@@ -58,7 +61,7 @@ public class WebSocketTool implements McpTool {
             }
         }
         activeConnections.clear();
-        messageHistory.clear();
+        messageCounts.clear();
         connectionCounter.set(0);
         wsSendExecutor.shutdownNow();
     }
@@ -226,25 +229,27 @@ public class WebSocketTool implements McpTool {
                 // Generate connection ID
                 String connectionId = "ws-" + connectionCounter.incrementAndGet();
                 activeConnections.put(connectionId, webSocket);
-                messageHistory.put(connectionId, new ArrayList<>());
+                messageCounts.put(connectionId, new AtomicLong());
                 
                 // Register message handler to track messages
                 webSocket.registerMessageHandler(new ExtensionWebSocketMessageHandler() {
                     @Override
                     public void textMessageReceived(TextMessage message) {
-                        recordMessage(connectionId, "text", message.payload(), "SERVER_TO_CLIENT");
+                        recordMessage(connectionId);
                     }
                     
                     @Override
                     public void binaryMessageReceived(BinaryMessage message) {
-                        recordMessage(connectionId, "binary", 
-                            Base64.getEncoder().encodeToString(message.payload().getBytes()), 
-                            "SERVER_TO_CLIENT");
+                        recordMessage(connectionId);
                     }
                     
                     @Override
                     public void onClose() {
-                        // Handle close event if needed
+                        // Server-initiated close: drop our bookkeeping so dead connections
+                        // don't linger. remove(key, value) leaves state alone if the ID was
+                        // already released by the close action.
+                        activeConnections.remove(connectionId, webSocket);
+                        messageCounts.remove(connectionId);
                     }
                 });
                 
@@ -310,7 +315,7 @@ public class WebSocketTool implements McpTool {
 
         try {
             sendFuture.get(WS_SEND_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            recordMessage(connectionId, binary ? "binary" : "text", message, "CLIENT_TO_SERVER");
+            recordMessage(connectionId);
 
             if (!McpUtils.isVerbose(arguments)) {
                 return McpUtils.createJsonResponse(Map.of("success", true, "connectionId", connectionId, "messageType", messageType));
@@ -389,6 +394,7 @@ public class WebSocketTool implements McpTool {
         
         String connectionId = arguments.get("connectionId").asText();
         ExtensionWebSocket webSocket = activeConnections.remove(connectionId);
+        messageCounts.remove(connectionId);
         
         if (webSocket == null) {
             return McpUtils.createErrorResponse("Connection not found: " + connectionId);
@@ -407,10 +413,10 @@ public class WebSocketTool implements McpTool {
         List<Map<String, Object>> connections = new ArrayList<>();
         for (Map.Entry<String, ExtensionWebSocket> entry : activeConnections.entrySet()) {
             String id = entry.getKey();
-            List<Map<String, Object>> history = messageHistory.get(id);
+            AtomicLong count = messageCounts.get(id);
             Map<String, Object> c = new HashMap<>();
             c.put("id", id);
-            c.put("messageCount", history != null ? history.size() : 0);
+            c.put("messageCount", count != null ? count.get() : 0L);
             connections.add(c);
         }
 
@@ -431,15 +437,10 @@ public class WebSocketTool implements McpTool {
         return McpUtils.createSuccessResponse(result.toString());
     }
     
-    private void recordMessage(String connectionId, String type, String content, String direction) {
-        List<Map<String, Object>> history = messageHistory.get(connectionId);
-        if (history != null) {
-            Map<String, Object> message = new HashMap<>();
-            message.put("time", ZonedDateTime.now().format(DateTimeFormatter.ISO_INSTANT));
-            message.put("type", type);
-            message.put("content", content);
-            message.put("direction", direction);
-            history.add(message);
+    private void recordMessage(String connectionId) {
+        AtomicLong count = messageCounts.get(connectionId);
+        if (count != null) {
+            count.incrementAndGet();
         }
     }
 }
