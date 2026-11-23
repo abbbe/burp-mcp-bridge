@@ -282,6 +282,27 @@ The bridge handles `SIGINT` (Ctrl+C) and `SIGTERM` signals gracefully:
 
 Press **Ctrl+C** to stop the bridge at any time.
 
+### Connecting an MCP client directly to the extension
+The extension's own port (8081) is a Streamable HTTP MCP server. HTTP-capable MCP clients can
+connect to it without the Node bridge, which also avoids keeping a bridge version in sync with the
+loaded jar:
+
+```bash
+claude mcp add --transport http burp http://127.0.0.1:8081/
+```
+
+- **MCP 2025-06-18 only.** `initialize` always answers `2025-06-18`. A request whose
+  `MCP-Protocol-Version` header names another revision gets `400`. Requests without the header are
+  accepted, so existing bridges keep working.
+- **Stateless JSON responses.** Each POST gets one `application/json` reply. Notifications and
+  client responses get `202` with no body. There is no SSE stream (`GET` returns `405`), no
+  sessions (`Mcp-Session-Id`), and no JSON-RPC batches (`400`).
+- **No Content-Length repair.** The bridge fixes `Content-Length` in ordinary `burp_custom_http`
+  requests. A direct connection sends request bytes as given, so supply correct framing yourself.
+- **Remote clients** (for example an agent in a container that reaches Burp as
+  `host.docker.internal`) need the extension bound to a reachable address (`BURP_MCP_SERVER_HOST`)
+  and the client's address in `BURP_MCP_ALLOWED_HOSTS`, as with a remote bridge.
+
 ## 📚 Self-Documentation System (v2.0.0)
 
 The extension now includes a unified help system that allows AI agents to discover and learn all capabilities autonomously:
