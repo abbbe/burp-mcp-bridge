@@ -219,7 +219,10 @@ public class AsyncRequestHandlerTest {
 
             JsonNode response = dispatcher(200).handle(method, request(method, "blocking"), "127.0.0.1");
             assertEquals(0, entered.getCount());
-            assertTrue(response.path("error").path("message").asText().contains("timed out"));
+            // A timed-out tool call is a tool execution error, not a protocol error.
+            assertFalse(response.has("error"));
+            assertTrue(response.path("result").path("isError").asBoolean());
+            assertTrue(response.path("result").path("content").get(0).path("text").asText().contains("timed out"));
             assertTrue(interrupted.await(2, TimeUnit.SECONDS));
             assertFastCallWorks();
         }

@@ -6,15 +6,42 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 
 /**
  * Protocol-only JSON-RPC routing used by the HTTP servlet and contract tests.
+ *
+ * <p>{@link #handleMessage} validates and classifies one JSON-RPC message the
+ * way the MCP 2025-06-18 Streamable HTTP transport requires (requests get a
+ * response, notifications and responses are accepted with 202). {@link #handle}
+ * routes an already-validated request.
  */
 final class JsonRpcDispatcher {
+    /** The only MCP protocol revision this endpoint speaks. */
+    static final String PROTOCOL_VERSION = ToolDocumentationExporter.MCP_PROTOCOL_VERSION;
+
+    static final int INVALID_REQUEST = -32600;
+    static final int METHOD_NOT_FOUND = -32601;
+    static final int INVALID_PARAMS = -32602;
+    static final int REQUEST_CANCELLED = -32800;
+
+    /**
+     * Outcome of one POSTed message: the HTTP status and the JSON body, or a
+     * null body when the message needs no response (202 Accepted).
+     */
+    record Reply(int status, JsonNode body) {
+        static Reply accepted() {
+            return new Reply(202, null);
+        }
+    }
+
     private static final String INITIALIZE_INSTRUCTIONS =
         "CRITICAL RULES for Burp MCP Bridge tools:\n\n" +
         "1. SENDING HTTP REQUESTS: Use burp_custom_http for immediate sends, protocol controls, and raw request work. " +
@@ -65,6 +92,13 @@ final class JsonRpcDispatcher {
     private final IntSupplier serverPort;
     private final Supplier<String> configSummary;
     private final ToolDocumentationExporter documentationExporter;
+    /**
+     * Tool calls that a {@code notifications/cancelled} can still stop, keyed by
+     * {@link #inFlightKey}. Without sessions the key can only scope ids by client
+     * host, so two clients on one host that reuse a request id concurrently can
+     * cancel each other's call; the first registration of a key wins.
+     */
+    private final Map<String, CompletableFuture<Object>> inFlight = new ConcurrentHashMap<>();
 
     JsonRpcDispatcher(ObjectMapper objectMapper,
                       Map<String, McpTool> tools,
@@ -82,19 +116,123 @@ final class JsonRpcDispatcher {
         this.documentationExporter = documentationExporter;
     }
 
+    static boolean isSupportedProtocolVersion(String version) {
+        return PROTOCOL_VERSION.equals(version);
+    }
+
+    /**
+     * Validate and classify one JSON-RPC message received over HTTP.
+     * Requests are routed through {@link #handle}; notifications and responses
+     * are accepted without a body; anything malformed is a 400 Invalid Request.
+     */
+    Reply handleMessage(JsonNode message, String clientHost) throws Exception {
+        if (message == null || message.isMissingNode()) {
+            return invalidRequest(null, "Empty JSON-RPC message");
+        }
+        if (message.isArray()) {
+            return invalidRequest(null, "Batch requests are not supported");
+        }
+        if (!message.isObject()) {
+            return invalidRequest(null, "JSON-RPC message must be an object");
+        }
+
+        JsonNode idNode = message.get("id");
+        JsonNode echoId = isValidId(idNode) ? idNode : null;
+
+        JsonNode version = message.get("jsonrpc");
+        if (version == null || !version.isTextual() || !"2.0".equals(version.asText())) {
+            return invalidRequest(echoId, "'jsonrpc' must be \"2.0\"");
+        }
+
+        if (message.has("method")) {
+            JsonNode methodNode = message.get("method");
+            if (!methodNode.isTextual() || methodNode.asText().isEmpty()) {
+                return invalidRequest(echoId, "'method' must be a non-empty string");
+            }
+            JsonNode params = message.get("params");
+            if (params != null && !params.isObject()) {
+                return invalidRequest(echoId, "'params' must be an object");
+            }
+            String method = methodNode.asText();
+            if (idNode == null) {
+                handleNotification(method, params, clientHost);
+                return Reply.accepted();
+            }
+            if (echoId == null) {
+                return invalidRequest(null, "'id' must be a string or number");
+            }
+            return new Reply(200, handle(method, message, clientHost));
+        }
+
+        if (echoId != null && isValidResponseBody(message)) {
+            // A client's reply to a server->client request. This server never
+            // sends those, so there is nothing to correlate it with.
+            return Reply.accepted();
+        }
+        return invalidRequest(echoId, "Message is neither a request, a notification, nor a response");
+    }
+
+    private Reply invalidRequest(JsonNode id, String detail) {
+        return new Reply(400, createErrorResponse(id, INVALID_REQUEST, "Invalid Request: " + detail));
+    }
+
+    private static boolean isValidId(JsonNode id) {
+        return id != null && (id.isTextual() || id.isNumber());
+    }
+
+    private static boolean isValidResponseBody(JsonNode message) {
+        boolean hasResult = message.has("result");
+        boolean hasError = message.has("error");
+        if (hasResult == hasError) {
+            return false;
+        }
+        if (hasResult) {
+            return true;
+        }
+        JsonNode error = message.get("error");
+        return error.isObject()
+            && error.path("code").isIntegralNumber()
+            && error.path("message").isTextual();
+    }
+
+    private void handleNotification(String method, JsonNode params, String clientHost) {
+        if (!"notifications/cancelled".equals(method) || params == null) {
+            // notifications/initialized and everything else need no action.
+            return;
+        }
+        JsonNode requestId = params.get("requestId");
+        if (!isValidId(requestId)) {
+            return;
+        }
+        CompletableFuture<Object> future = inFlight.get(inFlightKey(clientHost, requestId));
+        if (future != null) {
+            // AsyncRequestHandler interrupts the worker when its future is cancelled.
+            future.cancel(true);
+        }
+    }
+
+    /** Number of tool calls currently cancellable; exposed for tests. */
+    int inFlightCount() {
+        return inFlight.size();
+    }
+
+    /** JsonNode#toString keeps "1" and 1 distinct, as JSON-RPC ids are. */
+    private static String inFlightKey(String clientHost, JsonNode id) {
+        return clientHost + '\0' + id.toString();
+    }
+
     JsonNode handle(String method, JsonNode request, String clientHost) throws Exception {
         Map<String, Object> result = new LinkedHashMap<>();
 
         switch (method) {
             case "initialize":
-                result.put("protocolVersion", ToolDocumentationExporter.MCP_PROTOCOL_VERSION);
-                result.put("capabilities", Map.of("tools", Map.of(), "logging", Map.of()));
+                // Only one revision is supported, so the answer is always it; a
+                // client that asked for another decides whether to continue.
+                result.put("protocolVersion", PROTOCOL_VERSION);
+                result.put("capabilities", Map.of("tools", Map.of()));
                 result.put("serverInfo", Map.of("name", "burp-mcp-bridge", "version", Version.VERSION));
                 result.put("instructions", INITIALIZE_INSTRUCTIONS);
                 break;
-
-            case "initialized":
-                return objectMapper.valueToTree(Map.of("jsonrpc", "2.0"));
 
             case "tools/list":
                 result.put("tools", tools.entrySet().stream()
@@ -124,45 +262,73 @@ final class JsonRpcDispatcher {
                 break;
 
             default:
-                return createErrorResponse(request.get("id"), -32601, "Method not found: " + method);
+                return createErrorResponse(request.get("id"), METHOD_NOT_FOUND, "Method not found: " + method);
         }
 
         return createSuccessResponse(request, result);
     }
 
     private JsonNode handleAsyncToolCall(JsonNode request, String clientHost) throws Exception {
+        JsonNode idNode = request.get("id");
         JsonNode params = request.get("params");
-        if (params == null || !params.has("name")) {
-            return createErrorResponse(request.get("id"), -32600, "Missing params.name");
+        JsonNode nameNode = params == null ? null : params.get("name");
+        if (nameNode == null || !nameNode.isTextual()) {
+            return createErrorResponse(idNode, INVALID_PARAMS, "Missing or invalid params.name");
         }
 
-        String toolName = params.get("name").asText();
+        String toolName = nameNode.asText();
         JsonNode arguments = params.has("arguments") ? params.get("arguments") : objectMapper.createObjectNode();
         if (!tools.containsKey(toolName)) {
-            return createErrorResponse(request.get("id"), -32601, "Unknown tool: " + toolName);
+            return createErrorResponse(idNode, INVALID_PARAMS, "Unknown tool: " + toolName);
         }
 
+        String cancelKey = isValidId(idNode) ? inFlightKey(clientHost, idNode) : null;
         CompletableFuture<Object> future = null;
         try {
             future = asyncToolExecutor.executeAsync(toolName, arguments, clientHost);
+            if (cancelKey != null) {
+                inFlight.putIfAbsent(cancelKey, future);
+            }
             Object toolResult = future.get(requestTimeoutMs.getAsInt(), TimeUnit.MILLISECONDS);
 
             Map<String, Object> result = new LinkedHashMap<>();
             applyToolResult(result, toolResult);
             return createSuccessResponse(request, result);
-        } catch (java.util.concurrent.TimeoutException e) {
-            return createErrorResponse(request.get("id"), -32603,
+        } catch (CancellationException e) {
+            // The client cancelled and will discard whatever is sent back.
+            return createErrorResponse(idNode, REQUEST_CANCELLED, "Request cancelled");
+        } catch (TimeoutException e) {
+            return toolExecutionError(request,
                 "Tool execution timed out after " + requestTimeoutMs.getAsInt() + "ms");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return createErrorResponse(request.get("id"), -32603, "Tool execution interrupted");
+            return toolExecutionError(request, "Tool execution interrupted");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            return toolExecutionError(request, "Tool execution failed: " + cause.getMessage());
         } catch (Exception e) {
-            return createErrorResponse(request.get("id"), -32603, "Tool execution failed: " + e.getMessage());
+            return toolExecutionError(request, "Tool execution failed: " + e.getMessage());
         } finally {
+            if (cancelKey != null && future != null) {
+                inFlight.remove(cancelKey, future);
+            }
             if (future != null && !future.isDone()) {
                 future.cancel(true);
             }
         }
+    }
+
+    /**
+     * Failures while running a known tool are tool results with isError, not
+     * JSON-RPC errors, so the model sees them (MCP tools spec).
+     */
+    private JsonNode toolExecutionError(JsonNode request, String message) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        applyToolResult(result, Map.of(
+            "content", List.of(Map.of("type", "text", "text", message)),
+            "isError", true
+        ));
+        return createSuccessResponse(request, result);
     }
 
     JsonNode createErrorResponse(JsonNode idNode, int code, String message) {
