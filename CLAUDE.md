@@ -361,4 +361,13 @@ The bridge now supports multiple transport modes:
 - **HTTP/SSE** - For OpenAI ChatGPT, Google Gemini
 - **Both** - Run simultaneously for multiple LLM clients
 
+### Connecting an MCP client directly to the extension
+
+Port 8081 is itself a Streamable HTTP MCP server, so HTTP-capable clients can skip the bridge:
+`claude mcp add --transport http burp http://127.0.0.1:8081/`
+
+- MCP **2025-06-18 only**; an `MCP-Protocol-Version` header naming another revision → 400 (no header is accepted).
+- Stateless JSON responses: notifications → 202, GET → 405; no SSE, no sessions, no batches.
+- **Content-Length is not repaired** on this path; send correctly framed `burp_custom_http` requests.
+
 Remember: When in doubt, use `burp_help`!
