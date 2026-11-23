@@ -2,7 +2,6 @@ package com.example.burpmcp;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.logging.Logging;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
@@ -10,13 +9,6 @@ import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 
-import javax.servlet.http.HttpServlet;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-import java.io.IOException;
-import java.io.ByteArrayOutputStream;
-import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -117,7 +109,13 @@ public class McpServer {
         context.setContextPath("/");
         server.setHandler(context);
 
-        context.addServlet(new ServletHolder(new McpHttpServlet()), "/*");
+        context.addServlet(new ServletHolder(new McpHttpServlet(
+            objectMapper,
+            jsonRpcDispatcher,
+            config::isHostAllowed,
+            config::getMaxRequestBytes,
+            message -> logging.logToError(message)
+        )), "/*");
 
         // Set graceful shutdown timeout
         server.setStopTimeout(5000); // 5 seconds
@@ -186,141 +184,6 @@ public class McpServer {
         }
     }
 
-    private class McpHttpServlet extends HttpServlet {
-        @Override
-        protected void doPost(HttpServletRequest request, HttpServletResponse response) 
-                throws IOException {
-            
-            response.setContentType("application/json");
-
-            String originHeader = request.getHeader("Origin");
-            boolean originAllowed = originHeader == null || isOriginAllowed(originHeader);
-            if (!originAllowed) {
-                response.setStatus(403);
-                objectMapper.writeValue(response.getOutputStream(),
-                    jsonRpcDispatcher.createErrorResponse(null, -32000, "Origin not allowed"));
-                return;
-            }
-
-            if (originHeader != null) {
-                response.setHeader("Access-Control-Allow-Origin", originHeader);
-                response.setHeader("Vary", "Origin");
-            }
-            response.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-            response.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-            String clientHost = request.getRemoteAddr();
-
-            JsonNode requestNode;
-            try {
-                byte[] body = readBoundedBody(request);
-                requestNode = objectMapper.readTree(body);
-            } catch (PayloadTooLargeException e) {
-                response.setStatus(413);
-                objectMapper.writeValue(response.getOutputStream(),
-                    jsonRpcDispatcher.createErrorResponse(null, -32001, e.getMessage()));
-                return;
-            } catch (Exception e) {
-                response.setStatus(400);
-                objectMapper.writeValue(response.getOutputStream(),
-                    jsonRpcDispatcher.createErrorResponse(null, -32700, "Invalid JSON payload: " + e.getMessage()));
-                return;
-            }
-
-            // readTree returns null for an empty body (no exception) — guard before deref.
-            if (requestNode == null) {
-                response.setStatus(400);
-                objectMapper.writeValue(response.getOutputStream(),
-                    jsonRpcDispatcher.createErrorResponse(null, -32700, "Empty JSON payload"));
-                return;
-            }
-
-            JsonNode methodNode = requestNode.get("method");
-            if (methodNode == null || !methodNode.isTextual()) {
-                response.setStatus(400);
-                objectMapper.writeValue(response.getOutputStream(),
-                    jsonRpcDispatcher.createErrorResponse(requestNode.get("id"), -32600, "Missing or invalid 'method'"));
-                return;
-            }
-
-            try {
-                JsonNode responseNode = jsonRpcDispatcher.handle(methodNode.asText(), requestNode, clientHost);
-                objectMapper.writeValue(response.getOutputStream(), responseNode);
-            } catch (Exception e) {
-                logging.logToError("Error handling MCP request: " + e.getMessage());
-                response.setStatus(500);
-                objectMapper.writeValue(response.getOutputStream(),
-                    jsonRpcDispatcher.createErrorResponse(requestNode.get("id"), -32603, "Internal error: " + e.getMessage()));
-            }
-        }
-        
-        @Override
-        protected void doOptions(HttpServletRequest request, HttpServletResponse response) {
-            String originHeader = request.getHeader("Origin");
-            boolean originAllowed = originHeader == null || isOriginAllowed(originHeader);
-            if (!originAllowed) {
-                response.setStatus(403);
-                return;
-            }
-
-            if (originHeader != null) {
-                response.setHeader("Access-Control-Allow-Origin", originHeader);
-                response.setHeader("Vary", "Origin");
-            }
-            response.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-            response.setHeader("Access-Control-Allow-Headers", "Content-Type");
-            response.setHeader("Access-Control-Max-Age", "600");
-            response.setStatus(200);
-        }
-    }
-
-    private boolean isOriginAllowed(String originHeader) {
-        try {
-            URI uri = new URI(originHeader);
-            String host = uri.getHost();
-            if (host == null) {
-                return false;
-            }
-            int port = uri.getPort();
-            String hostPort = port > 0 ? host + ":" + port : host;
-            boolean allowed = config.isHostAllowed(host) || config.isHostAllowed(hostPort);
-            if (!allowed) {
-                logging.logToError("CORS origin rejected: " + originHeader);
-            }
-            return allowed;
-        } catch (URISyntaxException e) {
-            logging.logToError("Invalid origin header: " + originHeader);
-            return false;
-        }
-    }
-
-    private byte[] readBoundedBody(HttpServletRequest request) throws IOException, PayloadTooLargeException {
-        long maxBytes = config.getMaxRequestBytes();
-        long contentLength = request.getContentLengthLong();
-        if (contentLength > maxBytes) {
-            throw new PayloadTooLargeException("Request body too large: " + contentLength + " bytes (max " + maxBytes + ")");
-        }
-
-        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-        byte[] data = new byte[8192];
-        long totalRead = 0;
-        int nRead;
-        while ((nRead = request.getInputStream().read(data, 0, data.length)) != -1) {
-            totalRead += nRead;
-            if (totalRead > maxBytes) {
-                throw new PayloadTooLargeException("Request body exceeded limit of " + maxBytes + " bytes");
-            }
-            buffer.write(data, 0, nRead);
-        }
-        return buffer.toByteArray();
-    }
-
-    private static class PayloadTooLargeException extends Exception {
-        public PayloadTooLargeException(String message) {
-            super(message);
-        }
-    }
-    
     /**
      * Factory that builds a FRESH tool instance per call.
      *
